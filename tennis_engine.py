@@ -165,7 +165,7 @@ def init_db():
             p1_won          INTEGER,        -- always 1 (winner = p1)
             source          TEXT,
 
-            # Serve stats (winner)
+            -- Serve stats (winner)
             p1_ace          INTEGER,
             p1_df           INTEGER,
             p1_svpt         INTEGER,
@@ -175,7 +175,7 @@ def init_db():
             p1_bpSaved      INTEGER,
             p1_bpFaced      INTEGER,
 
-            # Serve stats (loser)
+            -- Serve stats (loser)
             p2_ace          INTEGER,
             p2_df           INTEGER,
             p2_svpt         INTEGER,
@@ -185,11 +185,11 @@ def init_db():
             p2_bpSaved      INTEGER,
             p2_bpFaced      INTEGER,
 
-            # Odds
+            -- Odds
             p1_odds         REAL,
             p2_odds         REAL,
 
-            # Computed features
+            -- Computed features
             rank_diff               REAL DEFAULT 0,
             rank_ratio              REAL DEFAULT 1,
             log_rank_diff           REAL DEFAULT 0,
@@ -240,14 +240,14 @@ def init_db():
             last_rank_pts   INTEGER,
             last_updated    TEXT,
             total_matches   INTEGER DEFAULT 0,
-            # Surface win rates
+            -- Surface win rates
             hard_wins       INTEGER DEFAULT 0,
             hard_total      INTEGER DEFAULT 0,
             clay_wins       INTEGER DEFAULT 0,
             clay_total      INTEGER DEFAULT 0,
             grass_wins      INTEGER DEFAULT 0,
             grass_total     INTEGER DEFAULT 0,
-            # Serve averages (last 20 matches)
+            -- Serve averages (last 20 matches)
             avg_ace_rate    REAL DEFAULT 0,
             avg_df_rate     REAL DEFAULT 0,
             avg_1st_pct     REAL DEFAULT 0,
