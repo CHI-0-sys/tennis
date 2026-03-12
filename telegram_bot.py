@@ -55,7 +55,7 @@ def fmt_prediction(p: dict) -> str:
         h2h_str = (
             f"H2H: {p['p1_name'].split()[-1]} leads "
             f"{int(h2h_wr*h2h_tot)}-{h2h_tot - int(h2h_wr*h2h_tot)}"
-            if h2h_tot > 0 else "H2H: No prior meetings in DB"
+            if h2h_tot > 0 else "H2H: No meetings in DB"
         )
 
         stake_str = (
@@ -154,7 +154,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🎾 *TENNIS HUNTER*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"ATP + WTA Match Winner Prediction Bot\n"
+        f"Match Winner Prediction Bot\n"
         f"🌍 Timezone : *{TIMEZONE}*\n"
         f"💰 Bankroll : *${BANKROLL}*\n\n"
         f"📅 *Daily Schedule*\n"
@@ -163,10 +163,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"  9:00 AM → Yesterday's picks settled\n\n"
         f"📋 *Commands*\n"
         f"  /today — Today's value picks\n"
+        f"  /schedule — Full daily schedule\n"
         f"  /match Alcaraz vs Djokovic | clay\n"
         f"  /odds Alcaraz vs Djokovic | clay | 1.85 | 2.10\n"
-        f"  /atp — ATP matches only\n"
-        f"  /wta — WTA matches only\n"
+        f"  /atp, /wta, /itf, /challenger — Tour filters\n"
         f"  /player Alcaraz — player stats\n"
         f"  /h2h Alcaraz vs Djokovic\n"
         f"  /record — Win rate + ROI\n"
@@ -175,7 +175,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"  /retrain — Update model\n"
         f"  /status — DB + model health\n"
         f"  /mychatid\n\n"
-        f"🎾 Covers ATP + WTA | Hard, Clay, Grass\n"
+        f"🎾 Covers ATP, WTA, Challenger, ITF, UTR\n"
         f"📦 50,000+ matches training data\n"
         f"💡 Run /retrain first to load all data",
         parse_mode='Markdown'
@@ -274,71 +274,140 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_atp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show ATP matches only."""
-    ctx.args = ['ATP']
-    await cmd_tour_filter(update, ctx)
+    await _run_tour(update, ctx, 'ATP')
 
 async def cmd_wta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show WTA matches only."""
-    ctx.args = ['WTA']
-    await cmd_tour_filter(update, ctx)
+    await _run_tour(update, ctx, 'WTA')
 
-async def cmd_tour_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tour = ctx.args[0] if ctx.args else 'ATP'
-    msg  = await update.message.reply_text(f"🎾 Fetching {tour} matches...")
+async def cmd_itf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _run_tour(update, ctx, 'ITF')
+
+async def cmd_challenger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _run_tour(update, ctx, 'Challenger')
+
+
+async def _run_tour(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                     tour: str):
+    msg = await update.message.reply_text(
+        f"🎾 Fetching {tour} matches..."
+    )
     try:
-        matches = [m for m in engine.get_todays_matches(TIMEZONE)
-                   if m.get('tour') == tour]
+        import sportybet_tennis as sb
+        matches = sb.get_tennis_matches(TIMEZONE, tour_filter=tour)
         if not matches:
-            await msg.edit_text(f"No {tour} matches today.")
+            await msg.edit_text(f"📅 No {tour} matches found today.")
             return
+
         await msg.edit_text(
-            f"🎾 {len(matches)} {tour} matches — predicting...",
+            f"🎾 *{len(matches)} {tour} matches*\n"
+            f"⏳ Predicting...",
             parse_mode='Markdown'
         )
+
         predictions = []
+        value_picks = []
         for m in matches:
             try:
                 pred = engine.predict_winner(
                     p1_name=m['p1_name'], p2_name=m['p2_name'],
                     surface=m['surface'],
-                    tourney_level=m.get('tourney_level','S'),
-                    round_=m.get('round','R32'),
+                    tourney_level=m.get('tourney_level', 'S'),
+                    round_=m.get('round', 'R32'),
                     best_of=m.get('best_of', 3),
-                    p1_rank=m.get('p1_rank', 100),
-                    p2_rank=m.get('p2_rank', 100),
-                    tour=tour, bankroll=BANKROLL
+                    p1_rank=m.get('p1_rank', 200),
+                    p2_rank=m.get('p2_rank', 200),
+                    p1_odds=m.get('p1_odds'),
+                    p2_odds=m.get('p2_odds'),
+                    tour=m.get('tour', 'ATP'),
+                    bankroll=BANKROLL
                 )
                 pred['fixture_id']   = m['fixture_id']
-                pred['tourney_name'] = m.get('tourney_name','')
-                pred['time_local']   = m.get('time_local','TBD')
+                pred['tourney_name'] = m.get('tourney_name', '')
+                pred['time_local']   = m.get('time_local', 'TBD')
                 predictions.append(pred)
-            except Exception:
-                pass
+                if pred.get('has_value'):
+                    value_picks.append(pred)
+            except Exception as e:
+                log.error(f"Predict {m.get('p1_name')}: {e}")
 
-        value_picks = sorted(
-            [p for p in predictions if p['has_value']],
-            key=lambda x: x['edge_pct'], reverse=True
-        )
+        value_picks.sort(key=lambda x: x.get('edge_pct', 0), reverse=True)
         await update.message.reply_text(
             fmt_daily_summary(value_picks, len(predictions)),
             parse_mode='Markdown'
         )
-        for p in value_picks[:4]:
+        for p in value_picks[:5]:
             await asyncio.sleep(0.8)
+            kb = [[InlineKeyboardButton(
+                "📋 Log", callback_data=f"log_{p['fixture_id']}"
+            )]]
             await update.message.reply_text(
-                fmt_prediction(p), parse_mode='Markdown'
+                fmt_prediction(p), parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(kb)
             )
+        ctx.bot_data['today_predictions'] = {
+            p['fixture_id']: p for p in predictions
+        }
+    except Exception as e:
+        log.error(f"_run_tour: {e}", exc_info=True)
+        await msg.edit_text(f"❌ Error: {str(e)[:200]}")
 
+
+async def cmd_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Full schedule grouped by tournament. /schedule or /schedule itf"""
+    tour_filter = ctx.args[0].upper() if ctx.args else None
+    msg = await update.message.reply_text("🎾 Loading schedule...")
+    try:
+        import sportybet_tennis as sb
+        matches = sb.get_tennis_matches(TIMEZONE, tour_filter=tour_filter)
+        if not matches:
+            await msg.edit_text("📅 No matches found today.")
+            return
+
+        counts = {}
+        for m in matches:
+            t = m.get('tour', '?')
+            counts[t] = counts.get(t, 0) + 1
+
+        by_tourney = {}
+        for m in matches:
+            t = m.get('tourney_name', 'Unknown')
+            by_tourney.setdefault(t, []).append(m)
+
+        BADGE = {'ATP':'🔵','WTA':'🔴','ITF':'⚪','Challenger':'🟡','UTR':'🟢'}
+        count_str = ' | '.join(f"{t}:{n}" for t, n in sorted(counts.items()))
+
+        lines = [
+            f"🎾 *TENNIS SCHEDULE — TODAY*",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"📊 {len(matches)} matches | {count_str}",
+            f"Source: {'Sportybet' if matches[0].get('source')=='sportybet' else 'SofaScore'}",
+            f"",
+        ]
+        shown = 0
+        for tourney, ms in sorted(by_tourney.items())[:15]:
+            if shown >= 50: break
+            lines.append(f"🏆 *{tourney}* ({len(ms)})")
+            for m in ms[:5]:
+                badge = BADGE.get(m.get('tour',''), '🎾')
+                lines.append(
+                    f"  {badge} {m['p1_name']} vs {m['p2_name']}\n"
+                    f"     {m.get('surface','?')} | "
+                    f"{m.get('round','?')} | {m.get('time_local','TBD')}"
+                )
+                shown += 1
+            lines.append("")
+
+        if len(matches) > shown:
+            lines.append(f"_...{len(matches)-shown} more not shown_")
+        lines += ["━━━━━━━━━━━━━━━━━━━━",
+                  "/today /atp /wta /itf /challenger"]
+
+        await msg.edit_text("\n".join(lines), parse_mode='Markdown')
     except Exception as e:
         await msg.edit_text(f"❌ Error: {e}")
 
 
 async def cmd_match(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Usage: /match Alcaraz vs Djokovic | clay
-    Or:    /match Swiatek vs Sabalenka | hard
-    """
     text = ' '.join(ctx.args) if ctx.args else ''
     if ' vs ' not in text.lower():
         await update.message.reply_text(
@@ -376,10 +445,6 @@ async def cmd_match(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_odds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Usage: /odds Alcaraz vs Djokovic | clay | 1.60 | 2.30
-    Recalculates edge with your actual Sportybet odds.
-    """
     text = ' '.join(ctx.args) if ctx.args else ''
     parts = text.split('|')
     if len(parts) < 4 or ' vs ' not in parts[0].lower():
@@ -415,7 +480,6 @@ async def cmd_odds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show player career stats from DB."""
     name = ' '.join(ctx.args).title() if ctx.args else ''
     if not name:
         await update.message.reply_text("Usage: `/player Alcaraz`", parse_mode='Markdown')
@@ -442,8 +506,7 @@ async def cmd_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 (f'%{name}%', surf)
             ).fetchone()[0]
             total_s = w + l
-            if total_s > 0:
-                surf_stats[surf] = (w, total_s, round(w/max(total_s,1)*100,1))
+            surf_stats[surf] = (w, total_s, round(w/max(total_s,1)*100,1))
 
         last_rank = conn.execute(
             "SELECT p1_rank FROM matches WHERE p1_name LIKE ? ORDER BY match_date DESC LIMIT 1",
@@ -456,7 +519,7 @@ async def cmd_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         surf_lines = "\n".join([
             f"  {SURFACE_EMOJI.get(s,'🎾')} {s}: {v[0]}W/{v[1]}T ({v[2]}%)"
-            for s, v in surf_stats.items()
+            for s, v in surf_stats.items() if v[1] > 0
         ]) or "  No surface data"
 
         rank_str = f"#{last_rank[0]}" if last_rank else "Unknown"
@@ -477,7 +540,6 @@ async def cmd_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_h2h(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show H2H record between two players."""
     text = ' '.join(ctx.args) if ctx.args else ''
     if ' vs ' not in text.lower():
         await update.message.reply_text(
@@ -490,9 +552,9 @@ async def cmd_h2h(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         conn = sqlite3.connect(engine.DB_PATH)
-        p1_wins_row = conn.execute(
+        p1_wins = conn.execute(
             "SELECT COUNT(*), GROUP_CONCAT(tourney_name||' '||round||' '||score, ' | ') "
-            "FROM matches WHERE p1_name LIKE ? AND p2_name LIKE ?",
+            "FROM matches WHERE p1_name LIKE ? AND p2_name LIKE ? LIMIT 10",
             (f'%{p1}%', f'%{p2}%')
         ).fetchone()
         p2_wins = conn.execute(
@@ -501,7 +563,7 @@ async def cmd_h2h(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ).fetchone()[0]
         conn.close()
 
-        p1w   = p1_wins_row[0] if p1_wins_row else 0
+        p1w   = p1_wins[0] if p1_wins else 0
         total = p1w + p2_wins
 
         if total == 0:
@@ -511,7 +573,7 @@ async def cmd_h2h(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        recent = p1_wins_row[1] or ''
+        recent = p1_wins[1] or ''
 
         await update.message.reply_text(
             f"🎾 *H2H: {p1} vs {p2}*\n"
@@ -529,7 +591,7 @@ async def cmd_h2h(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_record(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         arg     = ctx.args[0] if ctx.args else None
-        tour    = arg.upper() if arg and arg.upper() in ('ATP','WTA') else None
+        tour    = arg.upper() if arg in ('atp','wta','ATP','WTA') else None
         last_n  = int(arg) if arg and arg.isdigit() else None
         stats   = tracker.get_stats(tour=tour, last_n=last_n)
         title   = f"📊 TENNIS HUNTER RECORD"
@@ -894,6 +956,9 @@ def main():
     app.add_handler(CommandHandler("today",    cmd_today))
     app.add_handler(CommandHandler("atp",      cmd_atp))
     app.add_handler(CommandHandler("wta",      cmd_wta))
+    app.add_handler(CommandHandler("itf",        cmd_itf))
+    app.add_handler(CommandHandler("challenger", cmd_challenger))
+    app.add_handler(CommandHandler("schedule",   cmd_schedule))
     app.add_handler(CommandHandler("match",    cmd_match))
     app.add_handler(CommandHandler("odds",     cmd_odds))
     app.add_handler(CommandHandler("player",   cmd_player))

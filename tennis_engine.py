@@ -77,6 +77,7 @@ ROUND_MAP = {
     'QF':  5,  # Quarterfinal
     'R16': 4,
     'R32': 3,
+    'R32': 3,
     'R64': 2,
     'R128':1,
     'RR':  4,  # Round Robin
@@ -386,8 +387,10 @@ def store_sackmann_matches(df: pd.DataFrame, tour: str = 'ATP'):
     conn = sqlite3.connect(DB_PATH)
     stored = skipped = 0
 
+    # Running player cache: player_name -> list of match results
     player_cache = {}   # name -> [{won, surface, ace_rate, ...}]
 
+    # Sort chronologically
     try:
         df['_date'] = pd.to_numeric(df['tourney_date'], errors='coerce')
         df = df.sort_values('_date').reset_index(drop=True)
@@ -402,6 +405,7 @@ def store_sackmann_matches(df: pd.DataFrame, tour: str = 'ATP'):
                 skipped += 1
                 continue
 
+            # Parse date
             raw_date = str(row.get('tourney_date', '')).strip()
             try:
                 match_date = datetime.strptime(raw_date[:8], '%Y%m%d').strftime('%Y-%m-%d')
@@ -421,6 +425,7 @@ def store_sackmann_matches(df: pd.DataFrame, tour: str = 'ATP'):
             w_age   = float(row.get('winner_age', 25) or 25)
             l_age   = float(row.get('loser_age', 25) or 25)
 
+            # Serve stats — safe extraction
             def safe_int(v):
                 try:
                     return int(float(v or 0))
@@ -451,6 +456,7 @@ def store_sackmann_matches(df: pd.DataFrame, tour: str = 'ATP'):
             l_bpS  = safe_int(row.get('l_bpSaved'))
             l_bpF  = safe_int(row.get('l_bpFaced'))
 
+            # ── Rolling features from player cache ──────────────────
             def get_player_stats(name, surf):
                 hist = player_cache.get(name, [])
                 if not hist:
@@ -499,6 +505,8 @@ def store_sackmann_matches(df: pd.DataFrame, tour: str = 'ATP'):
             ws = get_player_stats(winner, surface)
             ls = get_player_stats(loser,  surface)
 
+            # H2H
+            h2h_key = tuple(sorted([winner, loser]))
             h2h_all  = [m for m in player_cache.get(winner, [])
                         if m.get('opponent') == loser]
             h2h_surf = [m for m in h2h_all if m.get('surface') == surface]
@@ -508,16 +516,19 @@ def store_sackmann_matches(df: pd.DataFrame, tour: str = 'ATP'):
             h2h_surf_wins = sum(1 for m in h2h_surf if m['won'])
             h2h_surf_tot  = len(h2h_surf)
 
+            # Encoding
             surf_enc  = SURFACE_MAP.get(surface, 0)
             level_enc = LEVEL_MAP.get(level, 2)
             round_enc = ROUND_MAP.get(round_, 3)
             is_gs     = 1 if level == 'G' else 0
             is_m1000  = 1 if level == 'M' else 0
 
+            # Rank features
             rank_diff     = l_rank - w_rank   # positive = winner ranked higher
             rank_ratio    = round(l_rank / max(w_rank, 1), 3)
             log_rank_diff = round(np.log1p(abs(rank_diff)) * np.sign(rank_diff), 3)
 
+            # Serve rate features
             def ace_rate(ace, svpt):
                 return round(ace / max(svpt, 1), 4)
 
@@ -539,6 +550,7 @@ def store_sackmann_matches(df: pd.DataFrame, tour: str = 'ATP'):
                     p1_bpSaved, p1_bpFaced,
                     p2_ace, p2_df, p2_svpt, p2_1stIn, p2_1stWon, p2_2ndWon,
                     p2_bpSaved, p2_bpFaced,
+                    -- Feature columns
                     rank_diff, rank_ratio, log_rank_diff,
                     p1_surface_winrate, p2_surface_winrate, surface_winrate_diff,
                     p1_surface_games, p2_surface_games,
@@ -570,6 +582,7 @@ def store_sackmann_matches(df: pd.DataFrame, tour: str = 'ATP'):
                 w_age, l_age, str(row.get('score', '')), 1, 'sackmann',
                 w_ace, w_df, w_svpt, w_1stI, w_1stW, w_2ndW, w_bpS, w_bpF,
                 l_ace, l_df, l_svpt, l_1stI, l_1stW, l_2ndW, l_bpS, l_bpF,
+                # Features
                 rank_diff, rank_ratio, log_rank_diff,
                 ws['surface_winrate'], ls['surface_winrate'],
                 round(ws['surface_winrate'] - ls['surface_winrate'], 3),
@@ -591,11 +604,12 @@ def store_sackmann_matches(df: pd.DataFrame, tour: str = 'ATP'):
                 surf_enc, level_enc, round_enc,
                 is_gs, is_m1000,
                 ws['total'], ls['total'],
-                0.5,
+                0.5,  # implied prob — filled from tennis-data if available
             ))
 
             stored += 1
 
+            # Update cache AFTER insert — no leakage
             def build_cache_entry(won, surf, ace_r, df_r, p1st, w1st, w2nd, bp_s, opp):
                 return {
                     'won': won, 'surface': surf,
@@ -660,6 +674,8 @@ def train_model(tour: str = 'BOTH') -> tuple:
 
     log.info(f"Training {tour} model on {len(df)} matches")
 
+    # Build feature matrix — always p1=winner, so label=1
+    # But we need to train on BOTH perspectives (random flip 50%)
     feature_rows = []
     labels       = []
 
@@ -667,8 +683,9 @@ def train_model(tour: str = 'BOTH') -> tuple:
         try:
             feat = [float(row.get(c, 0) or 0) for c in FEATURE_COLUMNS]
             feature_rows.append(feat)
-            labels.append(1)
+            labels.append(1)  # p1 always wins in stored data
 
+            # Mirror: flip p1/p2 so model sees losing side too
             flipped = feat.copy()
             idx = {c: i for i, c in enumerate(FEATURE_COLUMNS)}
             pairs = [
@@ -816,9 +833,7 @@ def build_match_features(p1_name: str, p2_name: str,
         surf_loss = sum(1 for r in losses if r[0] == surf)
         surf_total = surf_wins + surf_loss
         surf_wr    = round(surf_wins / max(surf_total, 1), 3)
-
         overall_wr = round(len(wins) / max(n_recent, 1), 3)
-
         form5  = min(len(wins), 5)
         form10 = min(len(wins), 10)
 
@@ -969,10 +984,14 @@ def predict_winner(p1_name: str, p2_name: str,
         X_s = scaler.transform(X)
         p1_prob = float(model.predict_proba(X_s)[0][1])
 
-    except Exception:
+    except FileNotFoundError:
         log.info("Model not trained — using ranking fallback")
         rank_ratio = p2_rank / max(p1_rank, 1)
         p1_prob = round(min(0.85, max(0.15, rank_ratio / (rank_ratio + 1))), 3)
+
+    except Exception as e:
+        log.error(f"Predict error: {e}")
+        p1_prob = 0.5
 
     p2_prob = 1 - p1_prob
 
@@ -1046,101 +1065,68 @@ def predict_winner(p1_name: str, p2_name: str,
         'generated_at':      datetime.now().isoformat(),
     }
 
-def get_todays_matches(timezone: str = "Africa/Lagos") -> list:
+def get_todays_matches(timezone: str = "Africa/Lagos",
+                        tour_filter: str = None) -> list:
+    """
+    Fetch today's tennis matches.
+    Delegates to sportybet_tennis.py (Sportybet → SofaScore fallback).
+    Covers ATP, WTA, Challenger, ITF, UTR.
+    """
+    try:
+        import sportybet_tennis as sb
+        return sb.get_tennis_matches(timezone=timezone,
+                                      tour_filter=tour_filter)
+    except ImportError:
+        log.warning("sportybet_tennis.py not found")
+        return _espn_fallback(timezone)
+    except Exception as e:
+        log.error(f"get_todays_matches: {e}")
+        return _espn_fallback(timezone)
+
+
+def _espn_fallback(timezone: str = "Africa/Lagos") -> list:
+    """ESPN fallback — ATP + WTA only, less coverage."""
     TZ      = pytz.timezone(timezone)
     utc_now = datetime.now(pytz.utc)
-    dates   = [
-        utc_now.strftime('%Y%m%d'),
-        (utc_now + timedelta(days=1)).strftime('%Y%m%d'),
-    ]
-
-    all_matches = []
-    seen        = set()
-
+    matches = []
+    seen    = set()
     for tour_code, tour_name in [('atp', 'ATP'), ('wta', 'WTA')]:
-        for date_str in dates:
+        for date_str in [utc_now.strftime('%Y%m%d')]:
             try:
-                url  = f"{ESPN_BASE}/{tour_code}/scoreboard"
-                data = safe_get(url, params={'dates': date_str})
-
+                url  = (f"https://site.api.espn.com/apis/site/v2"
+                        f"/sports/tennis/{tour_code}/scoreboard")
+                data = safe_get(url, params={'dates': date_str, 'limit': 100})
                 for event in data.get('events', []):
                     try:
-                        if event['status']['type'].get('completed', False):
-                            continue
-
-                        eid   = str(event.get('id', ''))
-                        if eid in seen:
-                            continue
-                        seen.add(eid)
-
+                        eid  = str(event.get('id', ''))
+                        if eid in seen: continue
                         comps = event['competitions'][0]
-                        competitors = comps.get('competitors', [])
-                        if len(competitors) < 2:
-                            continue
-
-                        p1c = competitors[0]
-                        p2c = competitors[1]
-
-                        p1_name = p1c.get('athlete', {}).get('displayName',
-                                  p1c.get('team', {}).get('displayName', 'Player 1'))
-                        p2_name = p2c.get('athlete', {}).get('displayName',
-                                  p2c.get('team', {}).get('displayName', 'Player 2'))
-
-                        p1_rank = int(p1c.get('athlete', {}).get('rank', 100) or 100)
-                        p2_rank = int(p2c.get('athlete', {}).get('rank', 100) or 100)
-
-                        notes   = comps.get('notes', [])
-                        surface = 'Hard'
-                        for note in note:
-                            txt = str(note.get('headline', '')).lower()
-                            if 'clay' in txt:    surface = 'Clay'
-                            elif 'grass' in txt: surface = 'Grass'
-                            elif 'hard' in txt:  surface = 'Hard'
-
-                        tourney_name = event.get('season', {}).get('displayName',
-                                       event.get('name', ''))
-                        round_ = str(comps.get('type', {}).get('abbreviation', 'R32'))
-
-                        time_local = 'TBD'
-                        try:
-                            start  = event.get('date', '')
-                            if start:
-                                utc_dt = datetime.strptime(start[:16], '%Y-%m-%dT%H:%M')
-                                utc_dt = pytz.utc.localize(utc_dt)
-                                time_local = utc_dt.astimezone(TZ).strftime('%I:%M %p %Z')
-                        except Exception:
-                            pass
-
-                        all_matches.append({
-                            'fixture_id':    eid,
-                            'tour':          tour_name,
-                            'tourney_name':  tourney_name,
-                            'surface':       surface,
-                            'round':         round_,
-                            'best_of':       5 if 'grand slam' in tourney_name.lower() else 3,
-                            'tourney_level': 'G' if 'open' in tourney_name.lower() else 'S',
-                            'p1_name':       p1_name,
-                            'p2_name':       p2_name,
-                            'p1_rank':       p1_rank,
-                            'p2_rank':       p2_rank,
-                            'p1_rank_pts':   0,
-                            'p2_rank_pts':   0,
-                            'p1_age':        25.0,
-                            'p2_age':        25.0,
-                            'p1_odds':       None,
-                            'p2_odds':       None,
-                            'time_local':    time_local,
-                            'status':        event['status']['type'].get('shortDetail', ''),
+                        cl    = comps.get('competitors', [])
+                        if len(cl) < 2: continue
+                        p1 = (cl[0].get('athlete', {}).get('displayName') or
+                              cl[0].get('team', {}).get('displayName', 'P1'))
+                        p2 = (cl[1].get('athlete', {}).get('displayName') or
+                              cl[1].get('team', {}).get('displayName', 'P2'))
+                        seen.add(eid)
+                        matches.append({
+                            'fixture_id': eid, 'tour': tour_name,
+                            'tourney_name': event.get('name', ''),
+                            'surface': 'Hard', 'round': 'R32',
+                            'best_of': 3, 'tourney_level': 'S',
+                            'p1_name': p1, 'p2_name': p2,
+                            'p1_rank': int(cl[0].get('athlete', {}).get('rank') or 200),
+                            'p2_rank': int(cl[1].get('athlete', {}).get('rank') or 200),
+                            'p1_rank_pts': 0, 'p2_rank_pts': 0,
+                            'p1_age': 25.0, 'p2_age': 25.0,
+                            'p1_odds': None, 'p2_odds': None,
+                            'time_local': 'TBD', 'status': '',
+                            'source': 'espn',
                         })
-
-                    except Exception as e:
-                        log.warning(f"ESPN event error {tour_code}: {e}")
-
+                    except Exception:
+                        pass
             except Exception as e:
-                log.error(f"ESPN {tour_code} error: {e}")
-
-    log.info(f"Today's tennis matches: {len(all_matches)}")
-    return all_matches
+                log.debug(f"ESPN {tour_code}: {e}")
+    return matches
 
 def daily_retrain():
     log.info("Tennis Hunter retrain starting...")
