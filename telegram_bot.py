@@ -184,40 +184,54 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
-        "🎾 Fetching today's ATP + WTA matches..."
+        "🎾 Fetching today's tennis matches...\n"
+        "Trying SofaScore → Sportybet → ESPN → CSV backup..."
     )
     try:
         matches = engine.get_todays_matches(TIMEZONE)
+
         if not matches:
             await msg.edit_text(
-                "📅 No matches scheduled today.\n"
-                "Use /match to predict a specific matchup."
+                "❌ *All data sources failed*\n\n"
+                "• SofaScore: no response\n"
+                "• Sportybet: no response\n"
+                "• ESPN: no response\n"
+                "• Sackmann CSV: no response\n\n"
+                "Check Railway network settings or try:\n"
+                "`/match Alcaraz vs Djokovic | clay`\n"
+                "to predict a specific matchup manually.",
+                parse_mode='Markdown'
             )
             return
 
-        atp_count = sum(1 for m in matches if m['tour'] == 'ATP')
-        wta_count = sum(1 for m in matches if m['tour'] == 'WTA')
-
+        # Show what source loaded
+        source = matches[0].get('source', 'unknown') if matches else 'none'
         await msg.edit_text(
-            f"🎾 *{len(matches)} matches today*\n"
-            f"ATP: {atp_count} | WTA: {wta_count}\n"
+            f"✅ *{len(matches)} matches loaded* (via {source})\n"
             f"⏳ Running predictions...",
             parse_mode='Markdown'
         )
 
-        predictions  = []
-        value_picks  = []
+        # Count by tour
+        tours = {}
+        for m in matches:
+            t = m.get('tour', '?')
+            tours[t] = tours.get(t, 0) + 1
+
+        predictions = []
+        value_picks = []
 
         for m in matches:
             try:
                 pred = engine.predict_winner(
-                    p1_name=m['p1_name'], p2_name=m['p2_name'],
+                    p1_name=m['p1_name'],
+                    p2_name=m['p2_name'],
                     surface=m['surface'],
                     tourney_level=m.get('tourney_level', 'S'),
                     round_=m.get('round', 'R32'),
                     best_of=m.get('best_of', 3),
-                    p1_rank=m.get('p1_rank', 100),
-                    p2_rank=m.get('p2_rank', 100),
+                    p1_rank=m.get('p1_rank', 200),
+                    p2_rank=m.get('p2_rank', 200),
                     p1_odds=m.get('p1_odds'),
                     p2_odds=m.get('p2_odds'),
                     tour=m.get('tour', 'ATP'),
@@ -227,41 +241,44 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pred['tourney_name'] = m.get('tourney_name', '')
                 pred['time_local']   = m.get('time_local', 'TBD')
                 predictions.append(pred)
-                if pred['has_value']:
+                if pred.get('has_value'):
                     value_picks.append(pred)
             except Exception as e:
-                log.error(f"Predict error: {e}")
+                log.error(f"Predict {m.get('p1_name')}: {e}")
 
-        # Sort by edge
-        value_picks.sort(key=lambda x: x['edge_pct'], reverse=True)
+        value_picks.sort(key=lambda x: x.get('edge_pct', 0), reverse=True)
+        tour_str = ' | '.join(f"{t}:{n}" for t, n in sorted(tours.items()))
 
         await update.message.reply_text(
-            fmt_daily_summary(value_picks, len(predictions)),
+            f"🎾 *TENNIS HUNTER — {datetime.now().strftime('%b %d, %Y')}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 {len(matches)} matches | {tour_str}\n"
+            f"📡 Source: {source}\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
             parse_mode='Markdown'
         )
 
-        # Detailed cards
-        for p in value_picks[:5]:
-            await asyncio.sleep(0.8)
-            kb = [[InlineKeyboardButton(
-                "📋 Log this pick",
-                callback_data=f"log_{p['fixture_id']}"
-            )]]
+        if not value_picks:
             await update.message.reply_text(
-                fmt_prediction(p), parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup(kb)
+                f"📊 {len(predictions)} matches analyzed\n"
+                f"❌ No value picks today\n\n"
+                f"All edges below {engine.MIN_EDGE}% threshold.\n"
+                f"Use /schedule to see all matches.\n"
+                f"Use /match to predict a specific matchup."
             )
-
-        if not value_picks and predictions:
-            top3 = sorted(predictions, key=lambda x: x['win_prob'], reverse=True)[:3]
+        else:
             await update.message.reply_text(
-                "📊 *Top picks by probability (no value edge):*",
+                fmt_daily_summary(value_picks, len(predictions)),
                 parse_mode='Markdown'
             )
-            for p in top3:
-                await asyncio.sleep(0.8)
+            for p in value_picks[:5]:
+                await asyncio.sleep(0.7)
+                kb = [[InlineKeyboardButton(
+                    "📋 Log", callback_data=f"log_{p['fixture_id']}"
+                )]]
                 await update.message.reply_text(
-                    fmt_prediction(p), parse_mode='Markdown'
+                    fmt_prediction(p), parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup(kb)
                 )
 
         ctx.bot_data['today_predictions'] = {
@@ -270,7 +287,7 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         log.error(f"cmd_today: {e}", exc_info=True)
-        await msg.edit_text(f"❌ Error: {str(e)[:200]}\nTry /retrain first.")
+        await msg.edit_text(f"❌ Error: {str(e)[:200]}")
 
 
 async def cmd_atp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -292,14 +309,14 @@ async def _run_tour(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         f"🎾 Fetching {tour} matches..."
     )
     try:
-        import sportybet_tennis as sb
-        matches = sb.get_tennis_matches(TIMEZONE, tour_filter=tour)
+        matches = engine.get_todays_matches(TIMEZONE, tour_filter=tour)
         if not matches:
             await msg.edit_text(f"📅 No {tour} matches found today.")
             return
 
+        source = matches[0].get('source', 'unknown') if matches else 'unknown'
         await msg.edit_text(
-            f"🎾 *{len(matches)} {tour} matches*\n"
+            f"🎾 *{len(matches)} {tour} matches* (via {source})\n"
             f"⏳ Predicting...",
             parse_mode='Markdown'
         )
@@ -357,11 +374,12 @@ async def cmd_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tour_filter = ctx.args[0].upper() if ctx.args else None
     msg = await update.message.reply_text("🎾 Loading schedule...")
     try:
-        import sportybet_tennis as sb
-        matches = sb.get_tennis_matches(TIMEZONE, tour_filter=tour_filter)
+        matches = engine.get_todays_matches(TIMEZONE, tour_filter=tour_filter)
         if not matches:
             await msg.edit_text("📅 No matches found today.")
             return
+
+        source = matches[0].get('source', 'unknown') if matches else 'unknown'
 
         counts = {}
         for m in matches:
@@ -380,7 +398,7 @@ async def cmd_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🎾 *TENNIS SCHEDULE — TODAY*",
             f"━━━━━━━━━━━━━━━━━━━━",
             f"📊 {len(matches)} matches | {count_str}",
-            f"Source: {'Sportybet' if matches[0].get('source')=='sportybet' else 'SofaScore'}",
+            f"📡 Source: {source}",
             f"",
         ]
         shown = 0
@@ -943,6 +961,46 @@ async def job_remind_settle(context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /debug — test all data sources live.
+    Shows exactly which sources work from Railway.
+    """
+    msg = await update.message.reply_text("🔍 Testing all data sources...")
+    lines = ["🔍 *TENNIS DATA SOURCE DIAGNOSTICS*\n"]
+
+    sources = [
+        ('SofaScore',
+         lambda: engine.fetch_sofascore(TIMEZONE)),
+        ('Sportybet',
+         lambda: engine.fetch_sportybet(TIMEZONE)),
+        ('ESPN ATP',
+         lambda: engine.fetch_espn(TIMEZONE)),
+        ('Sackmann CSV',
+         lambda: engine.fetch_sackmann_upcoming(TIMEZONE)),
+    ]
+
+    for name, fn in sources:
+        try:
+            result = fn()
+            n = len(result)
+            if n > 0:
+                sample = result[0]
+                lines.append(
+                    f"✅ *{name}*: {n} matches\n"
+                    f"   Sample: {sample.get('p1_name','')} vs "
+                    f"{sample.get('p2_name','')}\n"
+                    f"   Tour: {sample.get('tour','')} | "
+                    f"Surface: {sample.get('surface','')}"
+                )
+            else:
+                lines.append(f"⚠️ *{name}*: 0 matches returned")
+        except Exception as e:
+            lines.append(f"❌ *{name}*: {str(e)[:80]}")
+
+    await msg.edit_text("\n\n".join(lines), parse_mode='Markdown')
+
+
 def main():
     if not TELEGRAM_TOKEN:
         print("❌ TELEGRAM_TOKEN not set in .env")
@@ -970,6 +1028,7 @@ def main():
     app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CommandHandler("mychatid", cmd_mychatid))
     app.add_handler(CommandHandler("bankroll", cmd_bankroll))
+    app.add_handler(CommandHandler("debug",    cmd_debug))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     jq = app.job_queue

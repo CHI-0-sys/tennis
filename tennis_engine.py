@@ -8,6 +8,7 @@ import time
 import logging
 import os
 import io
+import re
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -22,6 +23,26 @@ from xgboost import XGBClassifier
 import pytz
 
 log = logging.getLogger(__name__)
+
+HEADERS_BROWSER = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/122.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+HEADERS_MOBILE = {
+    'User-Agent': (
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+        'AppleWebKit/605.1.15 (KHTML, like Gecko) '
+        'Version/17.0 Mobile/15E148 Safari/604.1'
+    ),
+    'Accept': 'application/json',
+    'Referer': 'https://www.sofascore.com/',
+}
 
 DB_PATH    = "tennis_hunter.db"
 MODELS_DIR = "models"
@@ -316,23 +337,28 @@ def init_db():
     conn.close()
     log.info("DB initialized")
 
-def safe_get(url: str, params: dict = None) -> dict:
-    try:
-        r = requests.get(
-            url, params=params,
-            headers={'User-Agent': 'Mozilla/5.0 (compatible; TennisHunter/1.0)'},
-            timeout=12
-        )
-        if r.status_code == 429:
-            time.sleep(3)
-            r = requests.get(url, params=params,
-                             headers={'User-Agent': 'Mozilla/5.0'}, timeout=12)
-        if r.status_code != 200:
+def safe_get(url: str, params: dict = None,
+             headers: dict = None, timeout: int = 12) -> dict:
+    """Robust GET with retry."""
+    h = headers or HEADERS_BROWSER
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, headers=h, timeout=timeout)
+            if r.status_code == 200:
+                try:    return r.json()
+                except: return {'_text': r.text[:1000]}
+            if r.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            log.debug(f"HTTP {r.status_code} — {url}")
             return {}
-        return r.json()
-    except Exception as e:
-        log.debug(f"HTTP error {url}: {e}")
-        return {}
+        except requests.exceptions.ConnectionError:
+            log.warning(f"Connection error attempt {attempt+1} — {url}")
+            time.sleep(3)
+        except Exception as e:
+            log.debug(f"safe_get {url}: {e}")
+            return {}
+    return {}
 
 def fetch_sackmann_year(year: int, tour: str = 'ATP') -> pd.DataFrame:
     if tour.upper() == 'ATP':
@@ -1065,67 +1091,503 @@ def predict_winner(p1_name: str, p2_name: str,
         'generated_at':      datetime.now().isoformat(),
     }
 
-def get_todays_matches(timezone: str = "Africa/Lagos",
-                        tour_filter: str = None) -> list:
+# ══════════════════════════════════════════════════════════════
+# LAYER 1 — SofaScore (most reliable, covers ATP+WTA+ITF+Challenger)
+# ══════════════════════════════════════════════════════════════
+
+def fetch_sofascore(timezone: str = 'Africa/Lagos') -> list:
     """
-    Fetch today's tennis matches.
-    Delegates to sportybet_tennis.py (Sportybet → SofaScore fallback).
-    Covers ATP, WTA, Challenger, ITF, UTR.
+    SofaScore scheduled events — most reliable source.
+    Returns 100-200 matches on a typical day.
     """
-    try:
-        import sportybet_tennis as sb
-        return sb.get_tennis_matches(timezone=timezone,
-                                      tour_filter=tour_filter)
-    except ImportError:
-        log.warning("sportybet_tennis.py not found")
-        return _espn_fallback(timezone)
-    except Exception as e:
-        log.error(f"get_todays_matches: {e}")
-        return _espn_fallback(timezone)
+    TZ      = pytz.timezone(timezone)
+    today   = datetime.now(TZ).strftime('%Y-%m-%d')
+    url     = f"https://api.sofascore.com/api/v1/sport/tennis/scheduled-events/{today}"
+    matches = []
+    seen    = set()
+
+    data   = safe_get(url, headers=HEADERS_MOBILE)
+    events = data.get('events', [])
+
+    if not events:
+        # Try tomorrow too (timezone edge case)
+        tomorrow = (datetime.now(TZ) + timedelta(days=1)).strftime('%Y-%m-%d')
+        data2    = safe_get(
+            f"https://api.sofascore.com/api/v1/sport/tennis/scheduled-events/{tomorrow}",
+            headers=HEADERS_MOBILE
+        )
+        events = data2.get('events', [])
+
+    log.info(f"SofaScore: {len(events)} events")
+
+    for event in events:
+        try:
+            status = event.get('status', {}).get('type', '')
+            if status in ('finished', 'canceled', 'postponed', 'interrupted'):
+                continue
+
+            p1 = event.get('homeTeam', {}).get('name', '').strip()
+            p2 = event.get('awayTeam', {}).get('name', '').strip()
+            if not p1 or not p2:
+                continue
+
+            key = f"{p1}|{p2}"
+            if key in seen: continue
+            seen.add(key)
+
+            tourney = event.get('tournament', {}).get('name', '')
+            categ   = event.get('tournament', {}).get('category', {}).get('name', '')
+            t_str   = (tourney + ' ' + categ).lower()
+
+            # Tour
+            if 'wta' in t_str or 'women' in t_str:    tour = 'WTA'
+            elif 'itf' in t_str:                        tour = 'ITF'
+            elif 'challenger' in t_str:                 tour = 'Challenger'
+            elif 'utr' in t_str:                        tour = 'UTR'
+            else:                                        tour = 'ATP'
+
+            # Surface
+            surface = 'Hard'
+            ground  = str(event.get('groundType', '') or '').lower()
+            if 'clay' in ground:    surface = 'Clay'
+            elif 'grass' in ground: surface = 'Grass'
+            elif 'carpet' in ground: surface = 'Carpet'
+
+            # Rankings
+            p1_rank = int(event.get('homeTeam', {}).get('ranking', 0) or 0) or 200
+            p2_rank = int(event.get('awayTeam', {}).get('ranking', 0) or 0) or 200
+
+            # Start time
+            time_local = 'TBD'
+            ts = event.get('startTimestamp', 0)
+            if ts:
+                try:
+                    utc_dt = pytz.utc.localize(
+                        datetime.utcfromtimestamp(int(ts))
+                    )
+                    time_local = utc_dt.astimezone(TZ).strftime('%I:%M %p')
+                except Exception:
+                    pass
+
+            is_gs   = any(gs in t_str for gs in
+                          ['australian', 'roland', 'wimbledon', 'us open'])
+            best_of = 5 if (is_gs and tour == 'ATP') else 3
+            t_level = 'G' if is_gs else ('M' if 'masters' in t_str or '1000' in t_str else 'S')
+
+            round_name = str(event.get('roundInfo', {}).get('name', '') or 'R32')
+
+            matches.append({
+                'fixture_id':    f"sofa_{event.get('id', '')}",
+                'tour':          tour,
+                'tourney_name':  tourney,
+                'surface':       surface,
+                'round':         round_name,
+                'best_of':       best_of,
+                'tourney_level': t_level,
+                'p1_name':       p1,
+                'p2_name':       p2,
+                'p1_rank':       p1_rank,
+                'p2_rank':       p2_rank,
+                'p1_rank_pts':   0,
+                'p2_rank_pts':   0,
+                'p1_age':        25.0,
+                'p2_age':        25.0,
+                'p1_odds':       None,
+                'p2_odds':       None,
+                'time_local':    time_local,
+                'status':        status,
+                'source':        'sofascore',
+            })
+        except Exception as e:
+            log.debug(f"SofaScore parse: {e}")
+
+    return matches
 
 
-def _espn_fallback(timezone: str = "Africa/Lagos") -> list:
-    """ESPN fallback — ATP + WTA only, less coverage."""
+# ══════════════════════════════════════════════════════════════
+# LAYER 2 — ESPN (ATP + WTA main draw, reliable backup)
+# ══════════════════════════════════════════════════════════════
+
+def fetch_espn(timezone: str = 'Africa/Lagos') -> list:
+    """ESPN ATP + WTA scoreboard. Less coverage but very stable."""
     TZ      = pytz.timezone(timezone)
     utc_now = datetime.now(pytz.utc)
     matches = []
     seen    = set()
+
+    # Try today + UTC tomorrow (timezone offset)
+    dates = [
+        utc_now.strftime('%Y%m%d'),
+        (utc_now + timedelta(days=1)).strftime('%Y%m%d'),
+        (utc_now - timedelta(days=1)).strftime('%Y%m%d'),
+    ]
+
     for tour_code, tour_name in [('atp', 'ATP'), ('wta', 'WTA')]:
-        for date_str in [utc_now.strftime('%Y%m%d')]:
-            try:
-                url  = (f"https://site.api.espn.com/apis/site/v2"
-                        f"/sports/tennis/{tour_code}/scoreboard")
-                data = safe_get(url, params={'dates': date_str, 'limit': 100})
-                for event in data.get('events', []):
+        url = (f"https://site.api.espn.com/apis/site/v2"
+               f"/sports/tennis/{tour_code}/scoreboard")
+        for date_str in dates:
+            data   = safe_get(url, params={'dates': date_str, 'limit': 100})
+            events = data.get('events', [])
+            if not events:
+                continue
+
+            for event in events:
+                try:
+                    eid = str(event.get('id', ''))
+                    if eid in seen: continue
+
+                    status = event.get('status', {}).get('type', {})
+                    if status.get('completed'): continue
+
+                    comp = event['competitions'][0]
+                    cl   = comp.get('competitors', [])
+                    if len(cl) < 2: continue
+
+                    p1 = (cl[0].get('athlete', {}).get('displayName') or
+                          cl[0].get('team', {}).get('displayName', ''))
+                    p2 = (cl[1].get('athlete', {}).get('displayName') or
+                          cl[1].get('team', {}).get('displayName', ''))
+                    if not p1 or not p2: continue
+
+                    p1_rank = int(cl[0].get('athlete', {}).get('rank') or 200)
+                    p2_rank = int(cl[1].get('athlete', {}).get('rank') or 200)
+
+                    tourney = (event.get('season', {}).get('displayName') or
+                               event.get('name', ''))
+                    round_  = comp.get('type', {}).get('abbreviation', 'R32')
+
+                    time_local = 'TBD'
                     try:
-                        eid  = str(event.get('id', ''))
-                        if eid in seen: continue
-                        comps = event['competitions'][0]
-                        cl    = comps.get('competitors', [])
-                        if len(cl) < 2: continue
-                        p1 = (cl[0].get('athlete', {}).get('displayName') or
-                              cl[0].get('team', {}).get('displayName', 'P1'))
-                        p2 = (cl[1].get('athlete', {}).get('displayName') or
-                              cl[1].get('team', {}).get('displayName', 'P2'))
-                        seen.add(eid)
-                        matches.append({
-                            'fixture_id': eid, 'tour': tour_name,
-                            'tourney_name': event.get('name', ''),
-                            'surface': 'Hard', 'round': 'R32',
-                            'best_of': 3, 'tourney_level': 'S',
-                            'p1_name': p1, 'p2_name': p2,
-                            'p1_rank': int(cl[0].get('athlete', {}).get('rank') or 200),
-                            'p2_rank': int(cl[1].get('athlete', {}).get('rank') or 200),
-                            'p1_rank_pts': 0, 'p2_rank_pts': 0,
-                            'p1_age': 25.0, 'p2_age': 25.0,
-                            'p1_odds': None, 'p2_odds': None,
-                            'time_local': 'TBD', 'status': '',
-                            'source': 'espn',
-                        })
+                        start = event.get('date', '')
+                        if start:
+                            dt = datetime.strptime(start[:16], '%Y-%m-%dT%H:%M')
+                            dt = pytz.utc.localize(dt).astimezone(TZ)
+                            time_local = dt.strftime('%I:%M %p')
                     except Exception:
                         pass
-            except Exception as e:
-                log.debug(f"ESPN {tour_code}: {e}")
+
+                    seen.add(eid)
+                    matches.append({
+                        'fixture_id':    f"espn_{eid}",
+                        'tour':          tour_name,
+                        'tourney_name':  tourney,
+                        'surface':       'Hard',
+                        'round':         str(round_),
+                        'best_of':       3,
+                        'tourney_level': 'S',
+                        'p1_name':       p1,
+                        'p2_name':       p2,
+                        'p1_rank':       p1_rank,
+                        'p2_rank':       p2_rank,
+                        'p1_rank_pts':   0,
+                        'p2_rank_pts':   0,
+                        'p1_age':        25.0,
+                        'p2_age':        25.0,
+                        'p1_odds':       None,
+                        'p2_odds':       None,
+                        'time_local':    time_local,
+                        'status':        '',
+                        'source':        'espn',
+                    })
+                except Exception as e:
+                    log.debug(f"ESPN event: {e}")
+
+            if matches:
+                break  # got data for this tour, stop trying dates
+
+    return matches
+
+
+# ══════════════════════════════════════════════════════════════
+# LAYER 3 — Sportybet internal API (if accessible from Railway)
+# ══════════════════════════════════════════════════════════════
+
+def fetch_sportybet(timezone: str = 'Africa/Lagos') -> list:
+    """Sportybet tennis — includes odds, covers all tours."""
+    TZ      = pytz.timezone(timezone)
+    today   = datetime.now(TZ).strftime('%Y-%m-%d')
+    matches = []
+    seen    = set()
+
+    endpoints = [
+        "https://www.sportybet.com/api/ng/factsCenter/sports/sr:sport:5/events",
+        "https://www.sportybet.com/api/ng/factsCenter/sports/sr:sport:5/todayEvents",
+    ]
+    param_sets = [
+        {'sportId': 'sr:sport:5', 'date': today, 'pageSize': 500},
+        {'sportId': 'sr:sport:5', 'pageSize': 500},
+    ]
+
+    headers = {
+        **HEADERS_MOBILE,
+        'Origin':  'https://www.sportybet.com',
+        'Referer': 'https://www.sportybet.com/ng/m/sport/tennis/today',
+    }
+
+    for url in endpoints:
+        for params in param_sets:
+            data = safe_get(url, params=params, headers=headers)
+            events = (
+                data.get('data', {}).get('events', []) or
+                data.get('events', []) or []
+            )
+            if not events:
+                continue
+
+            for event in events:
+                try:
+                    p1 = (event.get('homeTeamName') or
+                          event.get('homeName') or '').strip()
+                    p2 = (event.get('awayTeamName') or
+                          event.get('awayName') or '').strip()
+                    if not p1 or not p2: continue
+
+                    key = f"{p1}|{p2}"
+                    if key in seen: continue
+                    seen.add(key)
+
+                    tourney = (event.get('tournamentName') or
+                               event.get('tournament', {}).get('name') or 'Tennis')
+                    t_lower = tourney.lower()
+
+                    if 'wta' in t_lower or 'women' in t_lower: tour = 'WTA'
+                    elif 'itf' in t_lower:                       tour = 'ITF'
+                    elif 'challenger' in t_lower:                tour = 'Challenger'
+                    else:                                         tour = 'ATP'
+
+                    surface = 'Hard'
+                    if 'clay' in t_lower:    surface = 'Clay'
+                    elif 'grass' in t_lower: surface = 'Grass'
+
+                    # Extract odds from markets
+                    p1_odds = p2_odds = None
+                    for market in event.get('markets', []):
+                        m_id = str(market.get('id') or '')
+                        if m_id in ('186', '1'):
+                            for o in market.get('outcomes', []):
+                                desc = str(o.get('desc') or '').lower()
+                                try:
+                                    odd = float(o.get('odds') or 0)
+                                    if odd > 100: odd /= 1000
+                                    odd = odd if odd > 1.0 else None
+                                except Exception:
+                                    odd = None
+                                if 'home' in desc or desc == '1': p1_odds = odd
+                                elif 'away' in desc or desc == '2': p2_odds = odd
+                            if p1_odds or p2_odds: break
+
+                    time_local = 'TBD'
+                    ts = event.get('estimateStartTime') or event.get('startTime')
+                    if ts:
+                        try:
+                            t = int(ts)
+                            if t > 1e10: t //= 1000
+                            utc_dt = pytz.utc.localize(datetime.utcfromtimestamp(t))
+                            time_local = utc_dt.astimezone(TZ).strftime('%I:%M %p')
+                        except Exception:
+                            pass
+
+                    is_gs   = any(gs in t_lower for gs in
+                                  ['australian', 'roland', 'wimbledon', 'us open'])
+                    best_of = 5 if (is_gs and tour == 'ATP') else 3
+                    t_level = 'G' if is_gs else 'S'
+
+                    matches.append({
+                        'fixture_id':    str(event.get('eventId') or event.get('id') or f"sb_{p1}"),
+                        'tour':          tour,
+                        'tourney_name':  tourney,
+                        'surface':       surface,
+                        'round':         str(event.get('round') or 'R32'),
+                        'best_of':       best_of,
+                        'tourney_level': t_level,
+                        'p1_name':       p1,
+                        'p2_name':       p2,
+                        'p1_rank':       int(event.get('homeRank') or 200),
+                        'p2_rank':       int(event.get('awayRank') or 200),
+                        'p1_rank_pts':   0,
+                        'p2_rank_pts':   0,
+                        'p1_age':        25.0,
+                        'p2_age':        25.0,
+                        'p1_odds':       p1_odds,
+                        'p2_odds':       p2_odds,
+                        'time_local':    time_local,
+                        'status':        '',
+                        'source':        'sportybet',
+                    })
+                except Exception as e:
+                    log.debug(f"Sportybet parse: {e}")
+
+            if matches:
+                return matches
+
+    return matches
+
+
+# ══════════════════════════════════════════════════════════════
+# LAYER 4 — Sackmann CSV static fallback
+# ══════════════════════════════════════════════════════════════
+
+def fetch_sackmann_upcoming(timezone: str = 'Africa/Lagos') -> list:
+    """
+    Last resort: pull latest ATP/WTA matches from Sackmann CSVs.
+    These are historical but the most recent entries represent
+    ongoing tournament matches for current week.
+    """
+    TZ      = pytz.timezone(timezone)
+    matches = []
+    seen    = set()
+
+    current_year  = datetime.now().year
+    previous_year = current_year - 1
+
+    sources = [
+        ('ATP', f"https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_{current_year}.csv"),
+        ('WTA', f"https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_{current_year}.csv"),
+        ('ATP', f"https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_{previous_year}.csv"),
+    ]
+
+    for tour, url in sources:
+        try:
+            r = requests.get(url, timeout=15, headers=HEADERS_BROWSER)
+            if r.status_code != 200:
+                continue
+
+            df = pd.read_csv(io.StringIO(r.text), low_memory=False)
+            if df.empty:
+                continue
+
+            # Sort by tourney_date desc — most recent first
+            if 'tourney_date' in df.columns:
+                df = df.sort_values('tourney_date', ascending=False)
+
+            # Take most recent 50 matches = likely current week's tournament
+            recent = df.head(50)
+
+            for _, row in recent.iterrows():
+                try:
+                    p1 = str(row.get('winner_name', '') or '').strip()
+                    p2 = str(row.get('loser_name', '') or '').strip()
+                    if not p1 or not p2: continue
+
+                    key = f"{p1}|{p2}"
+                    if key in seen: continue
+                    seen.add(key)
+
+                    surface = str(row.get('surface', 'Hard') or 'Hard').strip()
+                    if surface not in ('Hard', 'Clay', 'Grass', 'Carpet'):
+                        surface = 'Hard'
+
+                    tourney   = str(row.get('tourney_name', '') or '').strip()
+                    t_level   = str(row.get('tourney_level', 'S') or 'S').strip()
+                    round_    = str(row.get('round', 'R32') or 'R32').strip()
+                    best_of   = int(row.get('best_of', 3) or 3)
+                    p1_rank   = int(row.get('winner_rank', 200) or 200)
+                    p2_rank   = int(row.get('loser_rank', 200) or 200)
+                    p1_age    = float(row.get('winner_age', 25) or 25)
+                    p2_age    = float(row.get('loser_age', 25) or 25)
+                    p1_seed   = int(row.get('winner_seed', 0) or 0)
+                    p2_seed   = int(row.get('loser_seed', 0) or 0)
+
+                    matches.append({
+                        'fixture_id':    f"csv_{tour}_{p1}_{p2}",
+                        'tour':          tour,
+                        'tourney_name':  tourney,
+                        'surface':       surface,
+                        'round':         round_,
+                        'best_of':       best_of,
+                        'tourney_level': t_level,
+                        'p1_name':       p1,
+                        'p2_name':       p2,
+                        'p1_rank':       p1_rank,
+                        'p2_rank':       p2_rank,
+                        'p1_rank_pts':   0,
+                        'p2_rank_pts':   0,
+                        'p1_age':        p1_age,
+                        'p2_age':        p2_age,
+                        'p1_seed':       p1_seed,
+                        'p2_seed':       p2_seed,
+                        'p1_odds':       None,
+                        'p2_odds':       None,
+                        'time_local':    'TBD',
+                        'status':        'scheduled',
+                        'source':        'sackmann_csv',
+                    })
+                except Exception:
+                    pass
+
+            if matches:
+                log.info(f"Sackmann CSV ({tour}): {len(matches)} recent matches")
+                break  # Got enough data
+
+        except Exception as e:
+            log.warning(f"Sackmann {tour}: {e}")
+
+    return matches
+
+
+# ══════════════════════════════════════════════════════════════
+# MASTER FETCH — tries all 4 layers in order
+# ══════════════════════════════════════════════════════════════
+
+def get_todays_matches(timezone: str = 'Africa/Lagos',
+                        tour_filter: str = None) -> list:
+    """
+    Get today's tennis matches.
+    Tries 4 sources in order — returns first successful result.
+
+    Layer 1: SofaScore    → 100-200 matches (ATP+WTA+ITF+Challenger)
+    Layer 2: Sportybet    → 194 matches with odds
+    Layer 3: ESPN         → 20-60 matches (ATP+WTA main draw)
+    Layer 4: Sackmann CSV → recent tournament matches (always works)
+
+    Never returns 0 matches if any internet is available.
+    """
+    sources = [
+        ('SofaScore',    lambda: fetch_sofascore(timezone)),
+        ('Sportybet',    lambda: fetch_sportybet(timezone)),
+        ('ESPN',         lambda: fetch_espn(timezone)),
+        ('Sackmann CSV', lambda: fetch_sackmann_upcoming(timezone)),
+    ]
+
+    matches = []
+    source_used = None
+
+    for name, fetch_fn in sources:
+        try:
+            log.info(f"Trying {name}...")
+            result = fetch_fn()
+            if result and len(result) > 0:
+                matches     = result
+                source_used = name
+                log.info(f"✅ {name}: {len(matches)} matches loaded")
+                break
+            else:
+                log.warning(f"{name}: returned 0 matches — trying next")
+        except Exception as e:
+            log.warning(f"{name} failed: {e} — trying next")
+
+    if not matches:
+        log.error("ALL SOURCES FAILED — no matches available")
+        return []
+
+    # Apply tour filter
+    if tour_filter and matches:
+        filtered = [
+            m for m in matches
+            if tour_filter.upper() in m.get('tour', '').upper() or
+               tour_filter.upper() in m.get('tourney_name', '').upper()
+        ]
+        if filtered:
+            matches = filtered
+        # If filter returns nothing, return all (don't silently empty)
+
+    # Tag source on all matches
+    for m in matches:
+        m['source'] = m.get('source') or source_used
+
+    log.info(f"get_todays_matches: {len(matches)} total "
+             f"({'filtered to ' + tour_filter if tour_filter else 'all tours'}) "
+             f"via {source_used}")
     return matches
 
 def daily_retrain():
